@@ -20,10 +20,19 @@
 #define SERVER_IP "127.0.0.1" // Localhost for testing, change to actual server IP when deploying
 #define MAX_PLAYERS 10		  // Maximum number of players
 
+#define MSG_LOCK_REQUEST "lock_request"
+#define MSG_LOCK_GRANTED "lock_granted"
+#define MSG_LOCK_DENIED "lock_denied"
+#define MSG_LOCK_NOTIFICATION "lock_notification"
+
+pthread_mutex_t playerMutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t lockMutex = PTHREAD_MUTEX_INITIALIZER;
+
 int sockfd;
 struct sockaddr_in serverAddr;
 int localPlayerID = -1; // Initialize localPlayerID to -1 (not set)
-pthread_mutex_t lock;
+int hasLock = 0;		// Global variable to track lock ownership
+int lockRequested = 0;
 
 typedef struct
 {
@@ -64,9 +73,8 @@ void setupNetworking()
 
 void sendMessage(const char *message)
 {
-	pthread_mutex_lock(&lock);
 	sendto(sockfd, message, strlen(message), 0, (const struct sockaddr *)&serverAddr, sizeof(serverAddr));
-	pthread_mutex_unlock(&lock);
+	printf("Sent message: %s\n", message); // Debug print statement
 }
 
 int receiveMessage(char *buffer, size_t bufferSize)
@@ -76,9 +84,7 @@ int receiveMessage(char *buffer, size_t bufferSize)
 	int recv_len;
 
 	// Attempt to receive data from the socket
-	pthread_mutex_lock(&lock);
 	recv_len = recvfrom(sockfd, buffer, bufferSize, 0, (struct sockaddr *)&si_other, &slen);
-	pthread_mutex_unlock(&lock);
 
 	if (recv_len > 0)
 	{
@@ -94,23 +100,22 @@ void parseGameState(char *buffer)
 	int id, x, y, radius, speed;
 	if (sscanf(buffer, "id=%d,x=%d,y=%d,radius=%d,speed=%d", &id, &x, &y, &radius, &speed) == 5)
 	{
-		pthread_mutex_lock(&lock);
 		if (id >= 0 && id < MAX_PLAYERS)
 		{
+			pthread_mutex_lock(&playerMutex);
 			if (!players[id].active)
-			{ // If player is not active, activate them
+			{
 				players[id].active = true;
 				snprintf(players[id].name, BUFFER_SIZE, "Player-%d", id);
-				players[id].color = (id == localPlayerID) ? BLUE : RED; // Assign color dynamically if needed
+				players[id].color = (id == localPlayerID) ? BLUE : RED;
 				printf("Player %d activated at %d, %d\n", id, x, y);
 			}
-			// Update player's state
 			players[id].x = x;
 			players[id].y = y;
 			players[id].radius = radius;
 			players[id].speed = speed;
+			pthread_mutex_unlock(&playerMutex);
 		}
-		pthread_mutex_unlock(&lock);
 	}
 }
 
@@ -146,7 +151,7 @@ void CustomLog(int msgType, const char *text)
 
 void InitPlayers()
 {
-	pthread_mutex_lock(&lock);
+	pthread_mutex_lock(&playerMutex);
 	for (int i = 0; i < MAX_PLAYERS; i++)
 	{
 		snprintf(players[i].name, BUFFER_SIZE, "Player-%d", i);
@@ -164,11 +169,12 @@ void InitPlayers()
 	players[localPlayerID].x = WIDTH / 2;
 	players[localPlayerID].y = HEIGHT / 2;
 	players[localPlayerID].speed = SPEED_FACTOR;
-	pthread_mutex_unlock(&lock);
+	pthread_mutex_unlock(&playerMutex);
 }
 
 void DrawPlayers()
 {
+	pthread_mutex_lock(&playerMutex);
 	for (int i = 0; i < MAX_PLAYERS; i++)
 	{
 		if (players[i].active)
@@ -177,22 +183,84 @@ void DrawPlayers()
 			DrawText(players[i].name, players[i].x - players[i].radius, players[i].y - 10, 20, WHITE);
 		}
 	}
+	pthread_mutex_unlock(&playerMutex);
+}
+
+void requestLock()
+{
+	if (!hasLock && !lockRequested)
+	{
+		char buffer[BUFFER_SIZE];
+		sprintf(buffer, "%s,id=%d", MSG_LOCK_REQUEST, localPlayerID);
+		sendMessage(buffer);
+		printf("Player %d requested lock\n", localPlayerID); // Debug print statement
+		lockRequested = 1;									 // Set lockRequested to prevent repeated requests
+	}
 }
 
 void UpdatePlayerPosition(int index)
 {
 	if (index != localPlayerID)
-		return; // Ignore inputs for other players
+		return;
 
 	Circle *player = &players[index];
-	if (IsKeyDown(KEY_D))
-		player->x += player->speed;
-	if (IsKeyDown(KEY_A))
-		player->x -= player->speed;
-	if (IsKeyDown(KEY_W))
-		player->y -= player->speed;
-	if (IsKeyDown(KEY_S))
-		player->y += player->speed;
+	int initialX = player->x;
+	int initialY = player->y;
+
+	pthread_mutex_lock(&lockMutex);
+	if ((IsKeyDown(KEY_D) || IsKeyDown(KEY_A) || IsKeyDown(KEY_W) || IsKeyDown(KEY_S)) && !hasLock && !lockRequested)
+	{
+		requestLock();
+	}
+	pthread_mutex_unlock(&lockMutex);
+
+	if (hasLock)
+	{
+		int moved = 0;
+
+		pthread_mutex_lock(&playerMutex);
+		if (IsKeyDown(KEY_D))
+		{
+			player->x += player->speed;
+			moved = 1;
+		}
+		if (IsKeyDown(KEY_A))
+		{
+			player->x -= player->speed;
+			moved = 1;
+		}
+		if (IsKeyDown(KEY_W))
+		{
+			player->y -= player->speed;
+			moved = 1;
+		}
+		if (IsKeyDown(KEY_S))
+		{
+			player->y += player->speed;
+			moved = 1;
+		}
+
+		if (moved)
+		{
+			char buffer[128];
+			sprintf(buffer, "id=%d,x=%d,y=%d,radius=%d,speed=%d", localPlayerID, player->x, player->y, player->radius, player->speed);
+			sendMessage(buffer);
+		}
+		pthread_mutex_unlock(&playerMutex);
+
+		if (!IsKeyDown(KEY_D) && !IsKeyDown(KEY_A) && !IsKeyDown(KEY_W) && !IsKeyDown(KEY_S))
+		{
+			pthread_mutex_lock(&lockMutex);
+			hasLock = 0;
+			lockRequested = 0;
+			pthread_mutex_unlock(&lockMutex);
+		}
+	}
+
+	if (player->x != initialX || player->y != initialY)
+	{
+		printf("Player %d moved from (%d, %d) to (%d, %d)\n", index, initialX, initialY, player->x, player->y);
+	}
 }
 
 int CheckCollision(Circle c1, Circle c2)
@@ -203,6 +271,7 @@ int CheckCollision(Circle c1, Circle c2)
 
 void ProcessCollisionsBetweenPlayers()
 {
+	pthread_mutex_lock(&playerMutex);
 	for (int i = 0; i < MAX_PLAYERS; i++)
 	{
 		for (int j = i + 1; j < MAX_PLAYERS; j++)
@@ -224,16 +293,47 @@ void ProcessCollisionsBetweenPlayers()
 			}
 		}
 	}
+	pthread_mutex_unlock(&playerMutex);
+}
+
+void handleLockResponse(char *buffer)
+{
+	int id;
+	pthread_mutex_lock(&lockMutex);
+	if (sscanf(buffer, "lock_granted,id=%d", &id) == 1)
+	{
+		if (id == localPlayerID)
+		{
+			hasLock = 1;
+			lockRequested = 0;
+			printf("Lock granted to player %d\n", id);
+		}
+	}
+	else if (sscanf(buffer, "lock_notification,id=%d", &id) == 1)
+	{
+		if (id == localPlayerID)
+		{
+			hasLock = 1;
+		}
+		else
+		{
+			hasLock = 0;
+		}
+		printf("Lock held by player %d\n", id);
+	}
+	else if (sscanf(buffer, "lock_denied,id=%d", &id) == 1)
+	{
+		if (id == localPlayerID)
+		{
+			printf("Lock denied for player %d\n", id);
+			lockRequested = 0;
+		}
+	}
+	pthread_mutex_unlock(&lockMutex);
 }
 
 int main()
 {
-	if (pthread_mutex_init(&lock, NULL) != 0)
-	{
-		printf("\n mutex init has failed\n");
-		return EXIT_FAILURE;
-	}
-
 	InitWindow(WIDTH, HEIGHT, "Multiplayer Game");
 	SetTargetFPS(60);
 	setupNetworking();
@@ -261,7 +361,16 @@ int main()
 			lastNetworkCheck = GetTime();
 			if (receiveMessage(recvBuffer, sizeof(recvBuffer)))
 			{
-				parseGameState(recvBuffer);
+				if (strncmp(recvBuffer, MSG_LOCK_GRANTED, strlen(MSG_LOCK_GRANTED)) == 0 ||
+					strncmp(recvBuffer, MSG_LOCK_NOTIFICATION, strlen(MSG_LOCK_NOTIFICATION)) == 0 ||
+					strncmp(recvBuffer, MSG_LOCK_DENIED, strlen(MSG_LOCK_DENIED)) == 0)
+				{
+					handleLockResponse(recvBuffer);
+				}
+				else
+				{
+					parseGameState(recvBuffer);
+				}
 			}
 		}
 
@@ -286,6 +395,5 @@ int main()
 
 	CloseWindow();
 	close(sockfd);
-	pthread_mutex_destroy(&lock);
 	return 0;
 }
