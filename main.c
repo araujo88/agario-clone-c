@@ -4,16 +4,30 @@
 #include <time.h>
 #include <string.h>
 #include <math.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <pthread.h>
 
-#define WIDTH 1000
-#define HEIGHT 800
-#define MAX_BUFFER_SIZE 128
+#define WIDTH 800
+#define HEIGHT 600
+#define BUFFER_SIZE 128
 #define SPEED_FACTOR 2
 #define NUM_NPCS 20
+#define SERVER_PORT 8888
+#define SERVER_IP "127.0.0.1" // Localhost for testing, change to actual server IP when deploying
+#define MAX_PLAYERS 10		  // Maximum number of players
+
+int sockfd;
+struct sockaddr_in serverAddr;
+int localPlayerID = -1; // Initialize localPlayerID to -1 (not set)
+pthread_mutex_t lock;
 
 typedef struct
 {
-	char name[MAX_BUFFER_SIZE];
+	char name[BUFFER_SIZE];
 	int x;
 	int y;
 	int vx;
@@ -24,7 +38,81 @@ typedef struct
 	bool active;
 } Circle;
 
-Circle npcs[NUM_NPCS]; // Array to store circle data
+Circle players[MAX_PLAYERS]; // Array to store player data
+
+void setupNetworking()
+{
+	if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
+	{
+		perror("Socket creation failed");
+		exit(EXIT_FAILURE);
+	}
+	else
+	{
+		printf("Socket created successfully.\n");
+	}
+
+	memset(&serverAddr, 0, sizeof(serverAddr));
+	serverAddr.sin_family = AF_INET;
+	serverAddr.sin_port = htons(SERVER_PORT);
+	serverAddr.sin_addr.s_addr = inet_addr(SERVER_IP);
+
+	// Set to non-blocking mode
+	int flags = fcntl(sockfd, F_GETFL, 0);
+	fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+}
+
+void sendMessage(const char *message)
+{
+	pthread_mutex_lock(&lock);
+	sendto(sockfd, message, strlen(message), 0, (const struct sockaddr *)&serverAddr, sizeof(serverAddr));
+	pthread_mutex_unlock(&lock);
+}
+
+int receiveMessage(char *buffer, size_t bufferSize)
+{
+	struct sockaddr_in si_other;
+	socklen_t slen = sizeof(si_other);
+	int recv_len;
+
+	// Attempt to receive data from the socket
+	pthread_mutex_lock(&lock);
+	recv_len = recvfrom(sockfd, buffer, bufferSize, 0, (struct sockaddr *)&si_other, &slen);
+	pthread_mutex_unlock(&lock);
+
+	if (recv_len > 0)
+	{
+		buffer[recv_len] = '\0'; // Null-terminate the received data
+		return 1;				 // Data was received
+	}
+
+	return 0; // No data received
+}
+
+void parseGameState(char *buffer)
+{
+	int id, x, y, radius, speed;
+	if (sscanf(buffer, "id=%d,x=%d,y=%d,radius=%d,speed=%d", &id, &x, &y, &radius, &speed) == 5)
+	{
+		pthread_mutex_lock(&lock);
+		if (id >= 0 && id < MAX_PLAYERS)
+		{
+			if (!players[id].active)
+			{ // If player is not active, activate them
+				players[id].active = true;
+				snprintf(players[id].name, BUFFER_SIZE, "Player-%d", id);
+				players[id].color = (id == localPlayerID) ? BLUE : RED; // Assign color dynamically if needed
+				printf("Player %d activated at %d, %d\n", id, x, y);
+			}
+			// Update player's state
+			players[id].x = x;
+			players[id].y = y;
+			players[id].radius = radius;
+			players[id].speed = speed;
+		}
+		pthread_mutex_unlock(&lock);
+	}
+}
 
 void CustomLog(int msgType, const char *text)
 {
@@ -56,89 +144,55 @@ void CustomLog(int msgType, const char *text)
 	printf("%s\n", text);
 }
 
-void InitNpcs()
+void InitPlayers()
 {
-	for (int i = 0; i < NUM_NPCS; i++)
+	pthread_mutex_lock(&lock);
+	for (int i = 0; i < MAX_PLAYERS; i++)
 	{
-		snprintf(npcs[i].name, MAX_BUFFER_SIZE, "NPC-%d", i);
-		npcs[i].x = GetRandomValue(0, WIDTH);
-		npcs[i].y = GetRandomValue(0, HEIGHT);
-		npcs[i].speed = SPEED_FACTOR / (npcs[i].radius ? npcs[i].radius : 1);
-		npcs[i].vx = GetRandomValue(-npcs[i].speed, npcs[i].speed);
-		npcs[i].vy = GetRandomValue(-npcs[i].speed, npcs[i].speed);
-		npcs[i].radius = GetRandomValue(5, 30);
-		npcs[i].color = RED;
-		npcs[i].active = true;
-		CustomLog(LOG_DEBUG, npcs[i].name);
+		snprintf(players[i].name, BUFFER_SIZE, "Player-%d", i);
+		players[i].x = 0;
+		players[i].y = 0;
+		players[i].vx = 0;
+		players[i].vy = 0;
+		players[i].radius = 20; // Default size, adjust as needed
+		players[i].speed = SPEED_FACTOR;
+		players[i].color = (i == localPlayerID) ? BLUE : RED;
+		players[i].active = false; // Start as inactive
 	}
+	// Activate only the local player initially
+	players[localPlayerID].active = true;
+	players[localPlayerID].x = WIDTH / 2;
+	players[localPlayerID].y = HEIGHT / 2;
+	players[localPlayerID].speed = SPEED_FACTOR;
+	pthread_mutex_unlock(&lock);
 }
 
-void DrawNpcs()
+void DrawPlayers()
 {
-	for (int i = 0; i < NUM_NPCS; i++)
+	for (int i = 0; i < MAX_PLAYERS; i++)
 	{
-		if (npcs[i].active)
+		if (players[i].active)
 		{
-			DrawCircle(npcs[i].x, npcs[i].y, npcs[i].radius, npcs[i].color);
-			DrawText(npcs[i].name, npcs[i].x - 20, npcs[i].y - 10, 10, WHITE); // Adjusted text positioning and size
+			DrawCircle(players[i].x, players[i].y, players[i].radius, players[i].color);
+			DrawText(players[i].name, players[i].x - players[i].radius, players[i].y - 10, 20, WHITE);
 		}
 	}
 }
 
-void UpdateNpcs()
+void UpdatePlayerPosition(int index)
 {
-	for (int i = 0; i < NUM_NPCS; i++)
-	{
-		if (npcs[i].active)
-		{
-			// Update positions based on velocity
-			npcs[i].x += npcs[i].vx;
-			npcs[i].y += npcs[i].vy;
+	if (index != localPlayerID)
+		return; // Ignore inputs for other players
 
-			// Check for boundary collision and reverse velocity if necessary
-			if (npcs[i].x <= npcs[i].radius) // Adjust if NPC hits the left boundary
-			{
-				npcs[i].x = npcs[i].radius; // Set position exactly on the boundary
-				npcs[i].vx = -npcs[i].vx;	// Reverse velocity
-			}
-			else if (npcs[i].x >= WIDTH - npcs[i].radius) // Adjust if NPC hits the right boundary
-			{
-				npcs[i].x = WIDTH - npcs[i].radius; // Set position exactly on the boundary
-				npcs[i].vx = -npcs[i].vx;			// Reverse velocity
-			}
-
-			if (npcs[i].y <= npcs[i].radius) // Adjust if NPC hits the top boundary
-			{
-				npcs[i].y = npcs[i].radius; // Set position exactly on the boundary
-				npcs[i].vy = -npcs[i].vy;	// Reverse velocity
-			}
-			else if (npcs[i].y >= HEIGHT - npcs[i].radius) // Adjust if NPC hits the bottom boundary
-			{
-				npcs[i].y = HEIGHT - npcs[i].radius; // Set position exactly on the boundary
-				npcs[i].vy = -npcs[i].vy;			 // Reverse velocity
-			}
-		}
-	}
-}
-
-void UpdatePlayerPosition(Circle *player)
-{
+	Circle *player = &players[index];
 	if (IsKeyDown(KEY_D))
-	{ // Move right
-		player->x = (player->x + player->speed > WIDTH - player->radius) ? WIDTH - player->radius : player->x + player->speed;
-	}
+		player->x += player->speed;
 	if (IsKeyDown(KEY_A))
-	{ // Move left
-		player->x = (player->x - player->speed < player->radius) ? player->radius : player->x - player->speed;
-	}
+		player->x -= player->speed;
 	if (IsKeyDown(KEY_W))
-	{ // Move up
-		player->y = (player->y - player->speed < player->radius) ? player->radius : player->y - player->speed;
-	}
+		player->y -= player->speed;
 	if (IsKeyDown(KEY_S))
-	{ // Move down
-		player->y = (player->y + player->speed > HEIGHT - player->radius) ? HEIGHT - player->radius : player->y + player->speed;
-	}
+		player->y += player->speed;
 }
 
 int CheckCollision(Circle c1, Circle c2)
@@ -147,100 +201,91 @@ int CheckCollision(Circle c1, Circle c2)
 	return distance < (c1.radius + c2.radius);
 }
 
-void ProcessCollisions(Circle *a, Circle *b)
+void ProcessCollisionsBetweenPlayers()
 {
-	if (a->active && b->active && CheckCollision(*a, *b))
+	for (int i = 0; i < MAX_PLAYERS; i++)
 	{
-		if (a->radius < b->radius)
+		for (int j = i + 1; j < MAX_PLAYERS; j++)
 		{
-			// A is smaller, B consumes A
-			b->radius = (int)(b->radius * 1.2);
-			b->speed = (b->speed * 0.99);
-			a->active = false; // Mark A as inactive
-		}
-		else if (b->radius < a->radius)
-		{
-			// B is smaller, A consumes B
-			a->radius = (int)(a->radius * 1.2);
-			a->speed = (a->speed * 0.99);
-			b->active = false; // Mark B as inactive
+			if (players[i].active && players[j].active && CheckCollision(players[i], players[j]))
+			{
+				// Example of a simple collision response
+				// Decide which player "consumes" the other based on radius, or handle as appropriate
+				if (players[i].radius > players[j].radius)
+				{
+					players[i].radius += 2;	   // Increase the radius of the bigger one
+					players[j].active = false; // Smaller one disappears
+				}
+				else
+				{
+					players[j].radius += 2;
+					players[i].active = false;
+				}
+			}
 		}
 	}
-}
-
-bool IsGameOver(Circle npcs[], int numNpcs)
-{
-	for (int i = 0; i < numNpcs; i++)
-	{
-		if (npcs[i].active) // If any NPC is still active, the game is not over
-		{
-			return false;
-		}
-	}
-	return true; // All NPCs are inactive, game is over
 }
 
 int main()
 {
-	// window dimensions
-	InitWindow(WIDTH, HEIGHT, "AGARio");
-	InitNpcs();
-
-	// circle coordinates
-	Circle player = {"Player",
-					 WIDTH / 2,
-					 HEIGHT / 2,
-					 0,
-					 0,
-					 25,
-					 10,
-					 BLUE,
-					 true};
-
-	SetTargetFPS(60);
-	while (!WindowShouldClose() && player.active)
+	if (pthread_mutex_init(&lock, NULL) != 0)
 	{
-		BeginDrawing();
-		ClearBackground(BLACK);
+		printf("\n mutex init has failed\n");
+		return EXIT_FAILURE;
+	}
 
-		// Update player position based on user input
-		UpdatePlayerPosition(&player);
+	InitWindow(WIDTH, HEIGHT, "Multiplayer Game");
+	SetTargetFPS(60);
+	setupNetworking();
 
-		// Process collisions with NPCs
-		for (int i = 0; i < NUM_NPCS; i++)
+	// Receive unique player ID from the server
+	char recvBuffer[BUFFER_SIZE];
+	while (localPlayerID == -1)
+	{
+		sendMessage("request_id");
+		if (receiveMessage(recvBuffer, sizeof(recvBuffer)))
 		{
-			if (npcs[i].radius > 0)
-				ProcessCollisions(&player, &npcs[i]);
-			for (int j = 0; j < NUM_NPCS; j++)
+			sscanf(recvBuffer, "id=%d", &localPlayerID);
+		}
+	}
+
+	InitPlayers();
+
+	double lastNetworkCheck = GetTime();
+
+	while (!WindowShouldClose())
+	{
+		// Network read throttling
+		if (GetTime() - lastNetworkCheck > 0.016)
+		{ // Approximately 60 Hz check rate
+			lastNetworkCheck = GetTime();
+			if (receiveMessage(recvBuffer, sizeof(recvBuffer)))
 			{
-				if (i != j && npcs[j].radius > 0) // Skip the collision check with itself
-					ProcessCollisions(&npcs[i], &npcs[j]);
+				parseGameState(recvBuffer);
 			}
 		}
 
-		// Update NPCs
-		UpdateNpcs();
+		BeginDrawing();
+		ClearBackground(BLACK);
 
-		// Draw player and NPCs
-		if (player.radius > 0)
-		{ // Only draw player if still "alive"
-			DrawCircle(player.x, player.y, player.radius, player.color);
-			DrawText(player.name, player.x, player.y, 20, WHITE);
-		}
-		DrawNpcs();
+		UpdatePlayerPosition(localPlayerID); // Update based on local input
+		ProcessCollisionsBetweenPlayers();	 // Handle collisions
+		DrawPlayers();						 // Draw all players
 
 		EndDrawing();
 
-		// Check if the game is over
-		if (IsGameOver(npcs, NUM_NPCS))
+		// Send local player state to server
+		Circle *localPlayer = &players[localPlayerID];
+		if (localPlayer->active)
 		{
-			DrawText("Game Over", WIDTH / 2 - MeasureText("Game Over", 20) / 2, HEIGHT / 2 - 10, 20, WHITE);
-			EndDrawing(); // Update the screen with "Game Over" message
-			break;		  // Break out of the loop to end the game
+			char buffer[128];
+			sprintf(buffer, "id=%d,x=%d,y=%d,radius=%d,speed=%d", localPlayerID, localPlayer->x, localPlayer->y, localPlayer->radius, localPlayer->speed);
+			sendMessage(buffer);
 		}
 	}
 
 	CloseWindow();
-
+	close(sockfd);
+	pthread_mutex_destroy(&lock);
 	return 0;
 }
