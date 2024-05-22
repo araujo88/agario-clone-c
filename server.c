@@ -13,6 +13,7 @@ pthread_mutex_t lockMutex = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct
 {
+    int sock;
     struct sockaddr_in addr;
     int id;
 } Client;
@@ -21,10 +22,11 @@ Client clients[MAX_PLAYERS];
 int numClients = 0;
 int currentLockHolder = -1; // No lock holder initially
 
-void addClient(struct sockaddr_in clientAddr)
+void addClient(int clientSock, struct sockaddr_in clientAddr)
 {
     if (numClients < MAX_PLAYERS)
     {
+        clients[numClients].sock = clientSock;
         clients[numClients].addr = clientAddr;
         clients[numClients].id = numClients;
         printf("New client connected with ID %d\n", numClients); // Log new client connection
@@ -32,12 +34,11 @@ void addClient(struct sockaddr_in clientAddr)
     }
 }
 
-int findClientIndex(struct sockaddr_in clientAddr)
+int findClientIndex(int clientSock)
 {
     for (int i = 0; i < numClients; i++)
     {
-        if (clients[i].addr.sin_addr.s_addr == clientAddr.sin_addr.s_addr &&
-            clients[i].addr.sin_port == clientAddr.sin_port)
+        if (clients[i].sock == clientSock)
         {
             return i;
         }
@@ -45,7 +46,7 @@ int findClientIndex(struct sockaddr_in clientAddr)
     return -1;
 }
 
-void handleLockRequest(int sockfd, int clientID, struct sockaddr_in clientAddr)
+void handleLockRequest(int clientSock, int clientID)
 {
     char response[BUFFER_SIZE];
 
@@ -56,41 +57,50 @@ void handleLockRequest(int sockfd, int clientID, struct sockaddr_in clientAddr)
         // Grant the lock
         currentLockHolder = clientID;
         snprintf(response, BUFFER_SIZE, "lock_granted,id=%d", clientID);
-        sendto(sockfd, response, strlen(response), 0, (struct sockaddr *)&clientAddr, sizeof(clientAddr));
-
-        // Log the lock grant
-        printf("Lock granted to player %d\n", clientID);
+        send(clientSock, response, strlen(response), 0);
+        printf("Lock granted to player %d\n", clientID); // Add this debug print
 
         // Notify all clients
         snprintf(response, BUFFER_SIZE, "lock_notification,id=%d", clientID);
         for (int i = 0; i < numClients; i++)
         {
-            sendto(sockfd, response, strlen(response), 0, (struct sockaddr *)&clients[i].addr, sizeof(clients[i].addr));
+            send(clients[i].sock, response, strlen(response), 0);
         }
     }
     else
     {
         // Lock denied
         snprintf(response, BUFFER_SIZE, "lock_denied,id=%d", clientID);
-        sendto(sockfd, response, strlen(response), 0, (struct sockaddr *)&clientAddr, sizeof(clientAddr));
-
-        // Log the lock denial
-        printf("Lock denied for player %d\n", clientID);
+        send(clientSock, response, strlen(response), 0);
+        printf("Lock denied for player %d\n", clientID); // Add this debug print
     }
 
     pthread_mutex_unlock(&lockMutex); // Unlock the mutex after accessing shared state
 }
 
-void handleNewConnection(int sockfd, struct sockaddr_in clientAddr)
+void handleLockRelease(int clientID)
 {
-    int clientIndex = findClientIndex(clientAddr);
+    pthread_mutex_lock(&lockMutex); // Lock the mutex before accessing shared state
+
+    if (currentLockHolder == clientID)
+    {
+        currentLockHolder = -1;
+        printf("Lock released by player %d\n", clientID); // Add this debug print
+    }
+
+    pthread_mutex_unlock(&lockMutex); // Unlock the mutex after accessing shared state
+}
+
+void handleNewConnection(int clientSock, struct sockaddr_in clientAddr)
+{
+    int clientIndex = findClientIndex(clientSock);
     if (clientIndex == -1)
     {
-        addClient(clientAddr);
+        addClient(clientSock, clientAddr);
         clientIndex = numClients - 1;
         char buffer[BUFFER_SIZE];
         snprintf(buffer, BUFFER_SIZE, "id=%d", clientIndex);
-        sendto(sockfd, buffer, strlen(buffer), 0, (struct sockaddr *)&clientAddr, sizeof(clientAddr));
+        send(clientSock, buffer, strlen(buffer), 0);
         printf("Assigned ID %d to new client\n", clientIndex); // Debug print statement
     }
     else
@@ -99,13 +109,18 @@ void handleNewConnection(int sockfd, struct sockaddr_in clientAddr)
     }
 }
 
-void handleMessage(int sockfd, char *buffer, struct sockaddr_in clientAddr)
+void handleMessage(int clientSock, char *buffer)
 {
     int clientID;
     if (sscanf(buffer, "lock_request,id=%d", &clientID) == 1)
     {
-        printf("Received lock request from player %d\n", clientID);
-        handleLockRequest(sockfd, clientID, clientAddr);
+        printf("Received lock request from player %d\n", clientID); // Add this debug print
+        handleLockRequest(clientSock, clientID);
+    }
+    else if (sscanf(buffer, "lock_release,id=%d", &clientID) == 1)
+    {
+        printf("Received lock release from player %d\n", clientID); // Add this debug print
+        handleLockRelease(clientID);
     }
     else if (sscanf(buffer, "id=%d,", &clientID) == 1)
     {
@@ -116,7 +131,7 @@ void handleMessage(int sockfd, char *buffer, struct sockaddr_in clientAddr)
             printf("Broadcasting message from player %d\n", clientID);
             for (int i = 0; i < numClients; i++)
             {
-                sendto(sockfd, buffer, strlen(buffer), 0, (struct sockaddr *)&clients[i].addr, sizeof(clients[i].addr));
+                send(clients[i].sock, buffer, strlen(buffer), 0);
             }
         }
         else
@@ -130,12 +145,12 @@ void handleMessage(int sockfd, char *buffer, struct sockaddr_in clientAddr)
 
 int main()
 {
-    int sockfd;
+    int serverSock, clientSock;
     struct sockaddr_in serverAddr, clientAddr;
     socklen_t addr_len = sizeof(clientAddr);
     char buffer[BUFFER_SIZE];
 
-    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
+    if ((serverSock = socket(AF_INET, SOCK_STREAM, 0)) < 0)
     {
         perror("Socket creation failed");
         exit(EXIT_FAILURE);
@@ -146,26 +161,34 @@ int main()
     serverAddr.sin_addr.s_addr = INADDR_ANY;
     serverAddr.sin_port = htons(PORT);
 
-    if (bind(sockfd, (const struct sockaddr *)&serverAddr, sizeof(serverAddr)) < 0)
+    if (bind(serverSock, (const struct sockaddr *)&serverAddr, sizeof(serverAddr)) < 0)
     {
         perror("Bind failed");
-        close(sockfd);
+        close(serverSock);
         exit(EXIT_FAILURE);
     }
 
+    listen(serverSock, MAX_PLAYERS);
     printf("Server is running...\n");
 
     while (1)
     {
-        int n = recvfrom(sockfd, buffer, BUFFER_SIZE, 0, (struct sockaddr *)&clientAddr, &addr_len);
+        clientSock = accept(serverSock, (struct sockaddr *)&clientAddr, &addr_len);
+        if (clientSock < 0)
+        {
+            perror("Accept failed");
+            continue;
+        }
+
+        int n = recv(clientSock, buffer, BUFFER_SIZE, 0);
         if (n > 0)
         {
             buffer[n] = '\0';
-            handleNewConnection(sockfd, clientAddr);
-            handleMessage(sockfd, buffer, clientAddr);
+            handleNewConnection(clientSock, clientAddr);
+            handleMessage(clientSock, buffer);
         }
     }
 
-    close(sockfd);
+    close(serverSock);
     return 0;
 }
