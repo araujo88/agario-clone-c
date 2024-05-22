@@ -8,6 +8,7 @@
 
 pthread_mutex_t lockMutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t lockCond = PTHREAD_COND_INITIALIZER;
+pthread_mutex_t clientMutex = PTHREAD_MUTEX_INITIALIZER;
 
 #define PORT 8888
 #define BUFFER_SIZE 128
@@ -26,6 +27,7 @@ int currentLockHolder = -1; // No lock holder initially
 
 void addClient(int clientSock, struct sockaddr_in clientAddr)
 {
+    pthread_mutex_lock(&clientMutex);
     if (numClients < MAX_PLAYERS)
     {
         clients[numClients].sock = clientSock;
@@ -34,6 +36,7 @@ void addClient(int clientSock, struct sockaddr_in clientAddr)
         printf("New client connected with ID %d\n", numClients); // Log new client connection
         numClients++;
     }
+    pthread_mutex_unlock(&clientMutex);
 }
 
 int findClientIndex(int clientSock)
@@ -142,12 +145,37 @@ void handleMessage(int clientSock, char *buffer)
     }
 }
 
+void *handleClient(void *arg)
+{
+    int clientIndex = *((int *)arg);
+    int clientSock = clients[clientIndex].sock;
+    char buffer[BUFFER_SIZE];
+
+    while (1)
+    {
+        int n = recv(clientSock, buffer, BUFFER_SIZE, 0);
+        if (n <= 0)
+        {
+            // Client disconnected or error occurred
+            printf("Client %d disconnected\n", clientIndex);
+            close(clientSock);
+            pthread_mutex_lock(&clientMutex);
+            numClients--;
+            pthread_mutex_unlock(&clientMutex);
+            pthread_exit(NULL);
+        }
+        buffer[n] = '\0';
+        handleMessage(clientSock, buffer);
+    }
+
+    return NULL;
+}
+
 int main()
 {
     int serverSock, clientSock;
     struct sockaddr_in serverAddr, clientAddr;
     socklen_t addr_len = sizeof(clientAddr);
-    char buffer[BUFFER_SIZE];
 
     if ((serverSock = socket(AF_INET, SOCK_STREAM, 0)) < 0)
     {
@@ -170,49 +198,29 @@ int main()
     listen(serverSock, MAX_PLAYERS);
     printf("Server is running...\n");
 
-    fd_set readfds;
+    pthread_t threads[MAX_PLAYERS];
+    int threadArgs[MAX_PLAYERS];
 
     while (1)
     {
-        FD_ZERO(&readfds);
-        FD_SET(serverSock, &readfds);
-        int max_sd = serverSock;
-
-        for (int i = 0; i < numClients; i++)
+        clientSock = accept(serverSock, (struct sockaddr *)&clientAddr, &addr_len);
+        if (clientSock < 0)
         {
-            int sd = clients[i].sock;
-            if (sd > 0)
-                FD_SET(sd, &readfds);
-            if (sd > max_sd)
-                max_sd = sd;
+            perror("Accept failed");
+            continue;
         }
 
-        int activity = select(max_sd + 1, &readfds, NULL, NULL, NULL);
+        addClient(clientSock, clientAddr);
 
-        if (FD_ISSET(serverSock, &readfds))
+        // Create a new thread to handle the client
+        threadArgs[numClients - 1] = numClients - 1;
+        if (pthread_create(&threads[numClients - 1], NULL, handleClient, &threadArgs[numClients - 1]) != 0)
         {
-            clientSock = accept(serverSock, (struct sockaddr *)&clientAddr, &addr_len);
-            if (clientSock < 0)
-            {
-                perror("Accept failed");
-                continue;
-            }
-
-            addClient(clientSock, clientAddr);
-        }
-
-        for (int i = 0; i < numClients; i++)
-        {
-            int sd = clients[i].sock;
-            if (FD_ISSET(sd, &readfds))
-            {
-                int n = recv(sd, buffer, BUFFER_SIZE, 0);
-                if (n > 0)
-                {
-                    buffer[n] = '\0';
-                    handleMessage(sd, buffer);
-                }
-            }
+            perror("Failed to create thread");
+            close(clientSock);
+            pthread_mutex_lock(&clientMutex);
+            numClients--;
+            pthread_mutex_unlock(&clientMutex);
         }
     }
 
