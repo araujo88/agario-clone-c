@@ -4,8 +4,10 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sys/select.h> // Add this include
 
 pthread_mutex_t lockMutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t lockCond = PTHREAD_COND_INITIALIZER;
 
 #define PORT 8888
 #define BUFFER_SIZE 128
@@ -69,7 +71,7 @@ void handleLockRequest(int clientSock, int clientID)
     }
     else
     {
-        // Lock denied
+        // Deny the lock
         snprintf(response, BUFFER_SIZE, "lock_denied,id=%d", clientID);
         send(clientSock, response, strlen(response), 0);
         printf("Lock denied for player %d\n", clientID); // Add this debug print
@@ -86,6 +88,7 @@ void handleLockRelease(int clientID)
     {
         currentLockHolder = -1;
         printf("Lock released by player %d\n", clientID); // Add this debug print
+        pthread_cond_signal(&lockCond);                   // Signal other threads waiting for the lock
     }
 
     pthread_mutex_unlock(&lockMutex); // Unlock the mutex after accessing shared state
@@ -93,26 +96,22 @@ void handleLockRelease(int clientID)
 
 void handleNewConnection(int clientSock, struct sockaddr_in clientAddr)
 {
-    int clientIndex = findClientIndex(clientSock);
-    if (clientIndex == -1)
-    {
-        addClient(clientSock, clientAddr);
-        clientIndex = numClients - 1;
-        char buffer[BUFFER_SIZE];
-        snprintf(buffer, BUFFER_SIZE, "id=%d", clientIndex);
-        send(clientSock, buffer, strlen(buffer), 0);
-        printf("Assigned ID %d to new client\n", clientIndex); // Debug print statement
-    }
-    else
-    {
-        printf("Client with ID %d already connected\n", clientIndex); // Debug print statement
-    }
+    addClient(clientSock, clientAddr);
+    int clientIndex = numClients - 1;
+    char buffer[BUFFER_SIZE];
+    snprintf(buffer, BUFFER_SIZE, "id=%d", clientIndex);
+    send(clientSock, buffer, strlen(buffer), 0);
+    printf("Assigned ID %d to new client\n", clientIndex); // Debug print statement
 }
 
 void handleMessage(int clientSock, char *buffer)
 {
     int clientID;
-    if (sscanf(buffer, "lock_request,id=%d", &clientID) == 1)
+    if (strncmp(buffer, "request_id", strlen("request_id")) == 0)
+    {
+        handleNewConnection(clientSock, clients[findClientIndex(clientSock)].addr);
+    }
+    else if (sscanf(buffer, "lock_request,id=%d", &clientID) == 1)
     {
         printf("Received lock request from player %d\n", clientID); // Add this debug print
         handleLockRequest(clientSock, clientID);
@@ -171,21 +170,49 @@ int main()
     listen(serverSock, MAX_PLAYERS);
     printf("Server is running...\n");
 
+    fd_set readfds;
+
     while (1)
     {
-        clientSock = accept(serverSock, (struct sockaddr *)&clientAddr, &addr_len);
-        if (clientSock < 0)
+        FD_ZERO(&readfds);
+        FD_SET(serverSock, &readfds);
+        int max_sd = serverSock;
+
+        for (int i = 0; i < numClients; i++)
         {
-            perror("Accept failed");
-            continue;
+            int sd = clients[i].sock;
+            if (sd > 0)
+                FD_SET(sd, &readfds);
+            if (sd > max_sd)
+                max_sd = sd;
         }
 
-        int n = recv(clientSock, buffer, BUFFER_SIZE, 0);
-        if (n > 0)
+        int activity = select(max_sd + 1, &readfds, NULL, NULL, NULL);
+
+        if (FD_ISSET(serverSock, &readfds))
         {
-            buffer[n] = '\0';
-            handleNewConnection(clientSock, clientAddr);
-            handleMessage(clientSock, buffer);
+            clientSock = accept(serverSock, (struct sockaddr *)&clientAddr, &addr_len);
+            if (clientSock < 0)
+            {
+                perror("Accept failed");
+                continue;
+            }
+
+            addClient(clientSock, clientAddr);
+        }
+
+        for (int i = 0; i < numClients; i++)
+        {
+            int sd = clients[i].sock;
+            if (FD_ISSET(sd, &readfds))
+            {
+                int n = recv(sd, buffer, BUFFER_SIZE, 0);
+                if (n > 0)
+                {
+                    buffer[n] = '\0';
+                    handleMessage(sd, buffer);
+                }
+            }
         }
     }
 

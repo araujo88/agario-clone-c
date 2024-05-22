@@ -207,7 +207,6 @@ void UpdatePlayerPosition(int index)
 	int initialX = player->x;
 	int initialY = player->y;
 
-	pthread_mutex_lock(&clientMutex); // Locking the mutex before checking key presses and updating position
 	if ((IsKeyDown(KEY_D) || IsKeyDown(KEY_A) || IsKeyDown(KEY_W) || IsKeyDown(KEY_S)) && !hasLock && !lockRequested)
 	{
 		requestLock();
@@ -215,6 +214,7 @@ void UpdatePlayerPosition(int index)
 
 	if (hasLock)
 	{
+		pthread_mutex_lock(&clientMutex); // Locking the mutex before updating position
 		int moved = 0;
 
 		if (IsKeyDown(KEY_D))
@@ -240,7 +240,7 @@ void UpdatePlayerPosition(int index)
 
 		if (moved)
 		{
-			char buffer[128];
+			char buffer[BUFFER_SIZE];
 			sprintf(buffer, "id=%d,x=%d,y=%d,radius=%d,speed=%d", localPlayerID, player->x, player->y, player->radius, player->speed);
 			sendMessage(buffer);
 			printf("Sent player position: %s\n", buffer); // Debug print statement
@@ -253,10 +253,10 @@ void UpdatePlayerPosition(int index)
 			char buffer[BUFFER_SIZE];
 			sprintf(buffer, "%s,id=%d", MSG_LOCK_RELEASE, localPlayerID);
 			sendMessage(buffer);
+			printf("Released lock: %s\n", buffer); // Debug print statement
 		}
+		pthread_mutex_unlock(&clientMutex); // Unlocking the mutex after updating position
 	}
-
-	pthread_mutex_unlock(&clientMutex); // Unlocking the mutex after checking key presses and updating position
 
 	if (player->x != initialX || player->y != initialY)
 	{
@@ -301,9 +301,9 @@ int main()
 
 	// Receive unique player ID from the server
 	char recvBuffer[BUFFER_SIZE];
+	sendMessage("request_id"); // Send request_id once
 	while (localPlayerID == -1)
 	{
-		sendMessage("request_id");
 		if (receiveMessage(recvBuffer, sizeof(recvBuffer)))
 		{
 			sscanf(recvBuffer, "id=%d", &localPlayerID);
